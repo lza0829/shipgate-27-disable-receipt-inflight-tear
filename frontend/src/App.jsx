@@ -1,6 +1,7 @@
 import React from 'react'
 import { NavLink, Route, Routes } from 'react-router-dom'
 import Overview from './pages/Overview'
+import Disable from './pages/Disable'
 import Apps from './pages/Apps'
 import Releases from './pages/Releases'
 import Promote from './pages/Promote'
@@ -14,6 +15,7 @@ import Audit from './pages/Audit'
 
 const links = [
   ['/', '总览'],
+  ['/停用', '停用'],
   ['/应用', '应用'],
   ['/发版单', '发版单'],
   ['/晋升', '晋升'],
@@ -36,7 +38,7 @@ export default function App() {
         </div>
         <nav className="nav">
           {links.map(([to, label]) => (
-            <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => (isActive ? 'active' : '')}>
+            <NavLink key={to} to={to} end={to === '/'} className={({ isActive }) => (isActive ? 'active' : '')} data-nav={label} data-testid={`nav-${label}`}>
               {label}
             </NavLink>
           ))}
@@ -45,6 +47,8 @@ export default function App() {
       <main className="main">
         <Routes>
           <Route path="/" element={<Overview />} />
+          <Route path="/停用" element={<Disable />} />
+          <Route path="/disable" element={<Disable />} />
           <Route path="/应用" element={<Apps />} />
           <Route path="/发版单" element={<Releases />} />
           <Route path="/晋升" element={<Promote />} />

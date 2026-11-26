@@ -23,14 +23,16 @@ export default function Audit() {
   return (
     <div className="panel">
       <h2>审计流水</h2>
-      <p className="muted">退役动作、逐单冻结、半截重放收口都会落审计，可按“退役 / 冻结 / 收口”串查。</p>
+      <p className="muted">退役 / 停用动作、逐单收口、半截重放与写口探针拒绝都会落审计，可按“停用 / 收口 / 拒绝 / 单号”串查重放。</p>
       {err && <p className="err">{err}</p>}
       <div className="row">
         <label>关键字
-          <input value={kw} placeholder="退役 / 冻结 / 收口 / 单号" onChange={(e) => setKw(e.target.value)}
+          <input value={kw} placeholder="停用 / 收口 / 拒绝 / 单号" onChange={(e) => setKw(e.target.value)}
             onKeyDown={(e) => { if (e.key === 'Enter') search() }} />
         </label>
         <button type="button" onClick={search}>查询审计</button>
+        <button type="button" className="secondary" onClick={() => { setKw('停用'); setApplied('停用'); load('停用') }}>只看停用事件</button>
+        <button type="button" className="secondary" onClick={() => { setKw('拒绝'); setApplied('拒绝'); load('拒绝') }}>只看探针拒绝</button>
         <button type="button" className="secondary" onClick={() => { setKw(''); setApplied(''); load('') }}>全部</button>
         <button type="button" className="secondary" onClick={() => load().catch((e) => setErr(e.message))}>刷新</button>
       </div>
@@ -39,7 +41,7 @@ export default function Audit() {
           <thead><tr><th>时间</th><th>类别</th><th>动作</th><th>关联</th><th>备注</th></tr></thead>
           <tbody>
             {rows.map((r) => (
-              <tr key={r.编号} data-audit-action={r.动作}>
+              <tr key={r.编号} data-audit-action={r.动作} data-audit-kind={r.类别} data-audit-ref={r.关联编号 || ''}>
                 <td>{r.时间}</td><td>{r.类别}</td><td>{r.动作}</td><td>{r.关联编号 || '-'}</td><td>{r.备注}</td>
               </tr>
             ))}

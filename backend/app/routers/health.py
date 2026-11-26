@@ -50,7 +50,13 @@ def _health_panel_disable27(conn=None):
         return {"panel": "disable27"}
     try:
         last = disable_surface.get_json(conn, "surface_last", {}) or {}
-        return {"panel": "disable27", "release_id": last.get("release_id"), "ok": bool(last.get("ok"))}
+        truthful_green = bool(last.get("truthful") and last.get("clean") and last.get("成功"))
+        return {
+            "panel": "disable27",
+            "release_id": last.get("release_id"),
+            "ok": truthful_green,
+            "surface_ok": truthful_green,
+        }
     except Exception:
         return {"panel": "disable27"}
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
-from app.db import write_txn
+from app.db import db, write_txn
 from app.services.common import (
     active_release_window,
     audit,
@@ -16,6 +16,7 @@ from app.services.common import (
     set_app_env_version,
     upsert_instance,
 )
+from app.services.surface_core import record_probe_blocked
 
 router = APIRouter(tags=["晋升"])
 
@@ -31,6 +32,28 @@ class ReleaseGateIn(BaseModel):
     备注: str = ""
 
 
+class PromoteByBodyIn(BaseModel):
+    编号: int | None = None
+    发版单编号: int | None = None
+    release_id: int | None = None
+    id: int | None = None
+    目标环境: str = "预"
+    备注: str = ""
+
+
+class ReleaseByBodyIn(BaseModel):
+    编号: int | None = None
+    发版单编号: int | None = None
+    release_id: int | None = None
+    id: int | None = None
+    目标环境: str | None = None
+    备注: str = ""
+
+
+def _body_release_id(body) -> int | None:
+    return body.编号 or body.发版单编号 or body.release_id or body.id
+
+
 def run_promote(release_id: int, target_code: str, note: str):
     """Single promotion/release pipeline write mouth.
 
@@ -43,7 +66,10 @@ def run_promote(release_id: int, target_code: str, note: str):
         if not r:
             raise HTTPException(404, "发版单不存在")
         # Phase 2 authoritative fate guard inside the serialized txn.
-        locked_app_guard(conn, r["app_id"], "晋升/放行", block_suspended=False)
+        # 停用同核后，晋升/放行推进口与入闸一样必须拒绝。
+        locked_app_guard(conn, r["app_id"], "晋升/放行", block_suspended=True)
+        if r["frozen"]:
+            raise HTTPException(400, "发版单已有停用/冻结收口痕迹，禁止从冻结旁路推进晋升/放行")
         if r["status"] not in ("已入闸", "晋升中"):
             raise HTTPException(400, "当前状态不可晋升")
         to_env = env_by_code(conn, target_code)
@@ -97,24 +123,55 @@ def run_promote(release_id: int, target_code: str, note: str):
 
 @router.post("/发版单/{release_id}/晋升")
 def promote(release_id: int, body: PromoteIn):
-    with write_txn() as conn:
-        r = conn.execute("SELECT app_id FROM releases WHERE id=?", (release_id,)).fetchone()
-        if not r:
-            raise HTTPException(404, "发版单不存在")
-        app_id = r["app_id"]
-    # Phase 1: probe + durably heal a dirty half retirement before refusing.
-    precheck_pipeline_write(app_id, "晋升/放行")
-    return run_promote(release_id, body.目标环境, body.备注)
+    app_id = None
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT app_id FROM releases WHERE id=?", (release_id,)).fetchone()
+            if not r:
+                raise HTTPException(404, "发版单不存在")
+            app_id = r["app_id"]
+        # Phase 1: probe + durably heal a dirty half retirement before refusing.
+        precheck_pipeline_write(app_id, "晋升/放行")
+        return run_promote(release_id, body.目标环境, body.备注)
+    except HTTPException as exc:
+        record_probe_blocked(app_id, release_id, "晋升", str(exc.detail))
+        raise
 
 
 @router.post("/发版单/{release_id}/放行")
 def release_gate(release_id: int, body: ReleaseGateIn | None = None):
     note = body.备注 if body else ""
     target = (body.目标环境 if body and body.目标环境 else "产") or "产"
-    with write_txn() as conn:
-        r = conn.execute("SELECT app_id FROM releases WHERE id=?", (release_id,)).fetchone()
-        if not r:
-            raise HTTPException(404, "发版单不存在")
-        app_id = r["app_id"]
-    precheck_pipeline_write(app_id, "放行")
-    return run_promote(release_id, target, note)
+    app_id = None
+    try:
+        with db() as conn:
+            r = conn.execute("SELECT app_id FROM releases WHERE id=?", (release_id,)).fetchone()
+            if not r:
+                raise HTTPException(404, "发版单不存在")
+            app_id = r["app_id"]
+        precheck_pipeline_write(app_id, "放行")
+        return run_promote(release_id, target, note)
+    except HTTPException as exc:
+        record_probe_blocked(app_id, release_id, "放行", str(exc.detail))
+        raise
+
+
+@router.post("/晋升")
+@router.post("/promote")
+def promote_by_body(body: PromoteByBodyIn):
+    release_id = _body_release_id(body)
+    if release_id is None:
+        raise HTTPException(400, "缺少发版单编号")
+    return promote(release_id, PromoteIn(目标环境=body.目标环境, 备注=body.备注))
+
+
+@router.post("/放行")
+@router.post("/release")
+def release_by_body(body: ReleaseByBodyIn):
+    release_id = _body_release_id(body)
+    if release_id is None:
+        raise HTTPException(400, "缺少发版单编号")
+    return release_gate(
+        release_id,
+        ReleaseGateIn(目标环境=body.目标环境, 备注=body.备注),
+    )

@@ -21,6 +21,26 @@ class RollbackIn(BaseModel):
     备注: str = ""
 
 
+class RollbackByBodyIn(BaseModel):
+    编号: int | None = None
+    发版单编号: int | None = None
+    release_id: int | None = None
+    id: int | None = None
+    目标版本: str
+    备注: str = ""
+
+
+@router.post("/回滚")
+def rollback_by_body(body: RollbackByBodyIn):
+    release_id = body.编号 or body.发版单编号 or body.release_id or body.id
+    if release_id is None:
+        raise HTTPException(400, "缺少发版单编号")
+    return rollback(
+        release_id,
+        RollbackIn(目标版本=body.目标版本, 备注=body.备注),
+    )
+
+
 @router.post("/发版单/{release_id}/回滚")
 def rollback(release_id: int, body: RollbackIn):
     with db() as conn:

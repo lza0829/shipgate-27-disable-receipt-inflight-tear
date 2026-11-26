@@ -9,7 +9,8 @@ CREATE TABLE IF NOT EXISTS apps (
   name TEXT NOT NULL UNIQUE,
   owner TEXT NOT NULL DEFAULT '',
   status TEXT NOT NULL DEFAULT '启用',
-  retired_at TEXT
+  retired_at TEXT,
+  disabled_at TEXT
 );
 CREATE TABLE IF NOT EXISTS environments (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -100,6 +101,15 @@ CREATE TABLE IF NOT EXISTS audit_events (
   created_at TEXT NOT NULL,
   note TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS disable_receipts (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  app_id INTEGER NOT NULL,
+  ok INTEGER NOT NULL DEFAULT 0,
+  clean INTEGER NOT NULL DEFAULT 0,
+  gap_count INTEGER NOT NULL DEFAULT 0,
+  payload_json TEXT NOT NULL DEFAULT '{}',
+  created_at TEXT NOT NULL
+);
 CREATE INDEX IF NOT EXISTS idx_releases_app_status ON releases(app_id, status);
 """
 
@@ -111,10 +121,19 @@ WINDOW_STATUSES = ("窗开", "窗关")
 
 def connect() -> sqlite3.Connection:
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=8.0)
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False, timeout=15.0)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
-    conn.execute("PRAGMA busy_timeout=8000")
+    conn.execute("PRAGMA busy_timeout=15000")
+    # WAL lets probe reads and audit writes coexist with the serializing
+    # BEGIN IMMEDIATE fate transaction; writer-vs-writer still goes through the
+    # busy timeout above.  Ignore filesystems/builds where WAL is unavailable.
+    if str(DB_PATH) != ":memory:":
+        try:
+            conn.execute("PRAGMA journal_mode=WAL")
+            conn.execute("PRAGMA synchronous=NORMAL")
+        except sqlite3.DatabaseError:
+            pass
     return conn
 
 
@@ -207,6 +226,11 @@ def _migrate(conn: sqlite3.Connection) -> None:
             conn.execute("PRAGMA foreign_keys=ON")
     elif "retired_at" not in app_cols:
         conn.execute("ALTER TABLE apps ADD COLUMN retired_at TEXT")
+
+    # Disable is a reversible but fate-coherent suspension marker. Keep its
+    # timestamp separate from terminal retirement.
+    if "disabled_at" not in _table_columns(conn, "apps"):
+        conn.execute("ALTER TABLE apps ADD COLUMN disabled_at TEXT")
 
     rel_cols = _table_columns(conn, "releases")
     if "frozen" not in rel_cols:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 from fastapi import APIRouter
 from app.db import db, rows_to_list
+from app.services.surface_core import reconcile_disable
 from app.services import disable_surface_ledger
 
 router = APIRouter(tags=["对账"])
@@ -41,10 +42,28 @@ def reconcile():
             ).fetchall()
         )
         promote_count = conn.execute("SELECT COUNT(*) AS c FROM promote_events").fetchone()["c"]
+        disable_core = reconcile_disable(conn)
         return {
             "发版统计": release_stats,
             "晋升事件数": promote_count,
             "名册与实例": version_vs_instance,
+            "停用对账": disable_core,
+            "停用差额": disable_core["差额"],
+            "差额": disable_core["差额"],
+            "缺口数": disable_core["缺口数"],
+            "停用缺口数": disable_core["缺口数"],
+            "gaps": disable_core["缺口"],
+            "缺口": disable_core["缺口"],
+            "ledger_ok": disable_core["ledger_ok"],
+            "aligned": disable_core["aligned"],
+            "ok": disable_core["ledger_ok"],
+            "clean": disable_core["干净"],
+            "干净": disable_core["干净"],
+            "lamp": disable_core["灯"],
+            "light": disable_core["灯"],
+            "gap_count": disable_core["缺口数"],
+            "灯": disable_core["灯"],
+            "停用灯": disable_core["停用灯"],
         }
 
 def _surface_reconcile_disable27() -> dict:

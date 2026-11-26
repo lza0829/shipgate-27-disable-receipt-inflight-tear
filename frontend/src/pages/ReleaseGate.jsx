@@ -67,10 +67,12 @@ export default function ReleaseGate() {
                     ) : (
                       <LockedButton
                         frozen={frozen}
+                        mouth="放行"
+                        data-open={r.写口?.放行 ? '1' : '0'}
                         className="danger release-row-btn"
                         onClick={() => release(r)}
                       >
-                        {busyId === r.编号 ? '放行中…' : frozen ? '放行（已冻结·探针）' : '放行到产'}
+                        {busyId === r.编号 ? '放行中…' : frozen ? '放行（停用/冻结·探针）' : '放行到产'}
                       </LockedButton>
                     )}
                   </td>

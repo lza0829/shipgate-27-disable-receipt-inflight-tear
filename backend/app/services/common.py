@@ -63,6 +63,7 @@ SELECT r.id AS 编号,
        a.owner AS 负责人,
        a.status AS 应用状态,
        a.retired_at AS 退役时间,
+       a.disabled_at AS 停用时间,
        r.target_version AS 目标版本,
        r.artifact_digest AS 制品摘要,
        r.status AS 状态,
@@ -74,9 +75,24 @@ SELECT r.id AS 编号,
        r.note AS 备注,
        COALESCE(r.frozen, 0) AS 冻结留痕,
        r.frozen_at AS 冻结留痕时间,
-       CASE WHEN a.status = '退役' THEN 1 ELSE 0 END AS 冻结,
-       CASE WHEN a.status = '退役' THEN '已冻结' ELSE '' END AS 冻结标,
-       CASE WHEN a.status = '退役' THEN '只读' ELSE '可写' END AS 读写态,
+       CASE
+         WHEN a.status='退役' OR a.status LIKE '%退役%' THEN 1
+         WHEN a.status='停用' OR a.status LIKE '%停用%' THEN 1
+         WHEN COALESCE(r.frozen, 0)=1 THEN 1
+         ELSE 0
+       END AS 冻结,
+       CASE
+         WHEN a.status='退役' OR a.status LIKE '%退役%' THEN '已冻结'
+         WHEN a.status='停用' OR a.status LIKE '%停用%' THEN '停用收口'
+         WHEN COALESCE(r.frozen, 0)=1 THEN '冻结旁路'
+         ELSE ''
+       END AS 冻结标,
+       CASE
+         WHEN a.status='退役' OR a.status LIKE '%退役%' THEN '只读'
+         WHEN a.status='停用' OR a.status LIKE '%停用%' THEN '停用收口·推进写口关闭'
+         WHEN COALESCE(r.frozen, 0)=1 THEN '冻结旁路·待核'
+         ELSE '可写'
+       END AS 读写态,
        CASE WHEN r.status IN ('已回滚','已关闭') THEN '已收口' ELSE '未收口' END AS 收口态,
        r.created_at AS 申请时间,
        r.admitted_at AS 入闸时间,
@@ -92,25 +108,60 @@ def decorate_release(d: dict | None) -> dict | None:
     """Attach the replayable fate fields to every release payload, everywhere."""
     if d is None:
         return None
-    frozen = bool(d.get("冻结"))
     status = d.get("状态")
+    app_fate = fate_of_status(d.get("应用状态"))
+    trace_frozen = bool(d.get("冻结留痕"))
+    retired_like = app_fate in ("retired", "dirty_closed")
+    suspended = app_fate == "suspended"
+    trace_bypass = trace_frozen and app_fate == "open"
+    closure_active = retired_like or suspended or trace_bypass
     unclosed = status in UNCLOSED_STATUSES
-    d["冻结"] = frozen
-    d["是否冻结"] = frozen
-    d["只读"] = frozen
-    d["可写"] = not frozen
+    inflight = status in INFLIGHT_STATUSES
+
     d["未收口"] = unclosed
+    d["在途"] = inflight
     d["收口态"] = "未收口" if unclosed else "已收口"
-    d["冻结标"] = "已冻结" if frozen else (d.get("冻结标") or "")
-    d["开闭态"] = "冻结只读" if frozen else "开放"
-    # 按“命运 + 单子状态”重放出来的各写口规则态（最终仍以后端写事务裁决为准）。
-    d["写口"] = {
-        "入闸": (not frozen) and status == "待入闸",
-        "流水线回执": not frozen,
-        "晋升": (not frozen) and status in ("已入闸", "晋升中"),
-        "放行": (not frozen) and status in ("已入闸", "晋升中"),
-        "回滚": (not frozen) and status in ("已放行", "晋升中"),
+    d["应用命运"] = app_fate
+    d["停用标"] = suspended
+    d["退役标"] = retired_like
+    d["冻结旁路"] = trace_bypass
+    d["冻结"] = 1 if closure_active else int(bool(d.get("冻结")))
+    d["是否冻结"] = bool(d["冻结"])
+    d["停用收口"] = bool(suspended and unclosed)
+    d["在途收口"] = bool(inflight and (retired_like or suspended or trace_bypass))
+    d["冻结标"] = d.get("冻结标") or ("已冻结" if retired_like else "")
+
+    mouths = {
+        "入闸": status == "待入闸",
+        "流水线回执": True,
+        "晋升": status in ("已入闸", "晋升中"),
+        "放行": status in ("已入闸", "晋升中"),
+        "回滚": status in ("已放行", "晋升中"),
     }
+    if retired_like:
+        mouths = {k: False for k in mouths}
+    elif suspended:
+        # 停用同核：入闸/晋升/放行推进链全拒；流水线与回滚补救口保持历史口径。
+        mouths["入闸"] = False
+        mouths["晋升"] = False
+        mouths["放行"] = False
+    elif trace_bypass:
+        # A persisted closure trace with no app marker is a half/bypass state.
+        # Fail closed on the progression chain until replay reconciles it.
+        mouths["入闸"] = False
+        mouths["晋升"] = False
+        mouths["放行"] = False
+
+    progression_closed = not any(mouths[k] for k in ("入闸", "晋升", "放行"))
+    same_core_closed = (not unclosed) or (closure_active and progression_closed)
+    d["写口"] = mouths
+    d["推进写口"] = {k: mouths[k] for k in ("入闸", "晋升", "放行")}
+    d["写口收口"] = same_core_closed
+    d["同核收口"] = same_core_closed
+    d["单态收口"] = "已收口" if same_core_closed else "未收口"
+    d["只读"] = not any(mouths.values())
+    d["可写"] = any(mouths.values())
+    d["开闭态"] = "冻结只读" if retired_like else ("停用收口" if suspended else ("冻结旁路" if trace_bypass else "开放"))
     return d
 
 
@@ -205,7 +256,9 @@ def fate_of_status(status: str | None) -> str:
     """
     if status == OPEN_STATUS:
         return "open"
-    if status == SUSPENDED_STATUS:
+    if status == SUSPENDED_STATUS or "停用" in str(status or ""):
+        # Exact 停用 is the stable state; values such as 停用中 are half markers
+        # and are replayed/normalized by the same disable core.
         return "suspended"
     if status == RETIRED_STATUS or "退役" in str(status or ""):
         return "retired"
@@ -228,8 +281,9 @@ def app_write_mouths(status: str | None) -> dict:
     if fate == "open":
         return {"申请": True, "入闸": True, "流水线回执": True, "晋升": True, "放行": True, "回滚": True}
     if fate == "suspended":
-        # 沿用骨架既有口径：停用只关新建/入闸，其余写口历史上未拦。
-        return {"申请": False, "入闸": False, "流水线回执": True, "晋升": True, "放行": True, "回滚": True}
+        # 停用的同核口径：新建/入闸与晋升/放行推进写口全部拒绝；
+        # 流水线回执和回滚仍保留为恢复/补救写口，并在各 payload 中如实露出。
+        return {"申请": False, "入闸": False, "流水线回执": True, "晋升": False, "放行": False, "回滚": True}
     # retired / dirty_closed：命运同一，全部关闭。
     return {"申请": False, "入闸": False, "流水线回执": False, "晋升": False, "放行": False, "回滚": False}
 
@@ -308,14 +362,16 @@ def heal_retirement_in_txn(conn, app) -> bool:
 
 
 def precheck_pipeline_write(app_id: int, action: str):
-    """Phase 1 probe: durably heal a dirty half-retirement, then reject.
+    """Phase 1 probe: durably heal dirty fate markers, then reject closed mouths.
 
     Runs in its own IMMEDIATE transaction so repair + audit survive even though
-    the probed write itself is refused. Returns the app Row when writes may
+    the probed write itself is refused. Returns the app snapshot when writes may
     proceed (a second locked check still has to run inside the write txn).
     """
     rejection: str | None = None
     app_snapshot = None
+    # Narrow survival mouths under suspension, matching app_write_mouths().
+    allowed_while_suspended = ("流水线", "回执", "回滚")
     with write_txn() as conn:
         app = conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
         if app is None:
@@ -325,6 +381,33 @@ def precheck_pipeline_write(app_id: int, action: str):
         if fate in ("retired", "dirty_closed"):
             heal_retirement_in_txn(conn, app)
             rejection = retired_block_message(app, action)
+        elif fate == "suspended":
+            # A probe against 停用中/ stripped traces must converge the half
+            # state before it returns the authoritative mouth rejection.
+            from app.services.surface_core import heal_disable_in_txn
+
+            heal_disable_in_txn(conn, app, explicit=False)
+            if not any(token in str(action) for token in allowed_while_suspended):
+                rejection = "应用已停用，禁止本写口"
+        elif fate == "open":
+            # An open app marker with a persisted frozen trace is the admit/
+            # disable interleaving bypass. Replay it to suspension before the
+            # probed mouth proceeds; survival mouths remain available.
+            bypass = conn.execute(
+                """
+                SELECT 1 FROM releases
+                WHERE app_id=? AND COALESCE(frozen,0)=1
+                  AND status IN ({})
+                LIMIT 1
+                """.format(",".join("?" for _ in UNCLOSED_STATUSES)),
+                (app_id, *UNCLOSED_STATUSES),
+            ).fetchone()
+            if bypass:
+                from app.services.surface_core import heal_disable_in_txn
+
+                heal_disable_in_txn(conn, app, explicit=False)
+                if not any(token in str(action) for token in allowed_while_suspended):
+                    rejection = "检测到冻结旁路，已按停用同核收束；禁止本写口"
     if rejection:
         raise HTTPException(400, rejection)
     return app_snapshot

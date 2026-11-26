@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api'
-import { FrozenBadge, isFrozen } from '../components/FreezeBadge'
+import { DisableLamp, FrozenBadge, isFrozen } from '../components/FreezeBadge'
 
 const surface_panel = true
 export default function Overview() {
@@ -15,10 +15,31 @@ export default function Overview() {
   const inflight = data.在途 || []
   const frozenCount = summary.冻结在途数 ?? inflight.filter(isFrozen).length
   const inflightCount = summary.在途数 ?? inflight.length
+  const disableCore = data.停用总览 || {}
+  const disableLamp = data.停用灯 || disableCore.灯 || 'off'
+  const disableGaps = data.停用缺口 || disableCore.缺口 || []
+  const disableGapCount = data.停用缺口数 ?? disableCore.缺口数 ?? disableGaps.length
   return (
     <div className="panel">
       <h2>总览</h2>
       <p className="muted">退役命运：{data.退役策略 || '带在途退役并冻结写口'}。冻结单不删除、不隐身，仍计入在途并单独露出。</p>
+
+      <section className={`overview-disable lamp-border-${disableLamp}`} data-testid="overview-disable-panel">
+        <div className="row">
+          <DisableLamp light={disableLamp} text={data.停用灯文案 || disableCore.灯文案} count={disableGapCount} data-testid="overview-disable-lamp" />
+          <span className="muted">总览末段对齐停用核、对账差额与审计；写口仍开时只允许缺口灯，不得无缺口长亮绿灯。</span>
+        </div>
+        {disableGaps.length > 0 && (
+          <ul className="gap-list compact" data-testid="overview-gap-list">
+            {disableGaps.slice(0, 8).map((g, i) => (
+              <li key={`${g.code}-${i}`} data-overview-gap={g.code}>
+                <b>{g.应用 || `应用#${g.应用编号 ?? ''}`}</b>：{g.缺口 || g.message}
+              </li>
+            ))}
+          </ul>
+        )}
+      </section>
+
       <div className="grid">
         <div className="stat"><div className="n" data-field="在途数">{inflightCount}</div><div className="l">在途（未收口）</div></div>
         <div className={`stat ${frozenCount ? 'frozen-stat' : ''}`}><div className="n" data-field="冻结在途数">{frozenCount}</div><div className="l">冻结在途</div></div>

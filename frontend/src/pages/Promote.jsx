@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react'
 import { api } from '../api'
-import { FrozenBadge, FateBanner, LockedButton, isFrozen } from '../components/FreezeBadge'
+import { FrozenBadge, FateBanner, LockedButton, isDisabledApp, isFrozen } from '../components/FreezeBadge'
 
 const surface_panel = true
 export default function Promote() {
@@ -20,6 +20,8 @@ export default function Promote() {
 
   const current = rows.find((r) => String(r.编号) === String(rid))
   const frozen = isFrozen(current)
+  const disabledCurrent = isDisabledApp(current)
+  const closedLabel = disabledCurrent ? '停用收口·点按探针' : '已冻结·点按探针'
 
   const go = async (target) => {
     setErr(''); setMsg('')
@@ -58,7 +60,7 @@ export default function Promote() {
           <select value={rid} onChange={(e) => setRid(e.target.value)}>
             {rows.map((r) => (
               <option key={r.编号} value={r.编号}>
-                {r.发版单号} · {r.应用}{isFrozen(r) ? ' · 已冻结' : ''} · {r.当前环境}
+                {r.发版单号} · {r.应用}{isDisabledApp(r) ? ' · 停用收口' : isFrozen(r) ? ' · 已冻结' : ''} · {r.当前环境}
               </option>
             ))}
           </select>
@@ -70,9 +72,9 @@ export default function Promote() {
             <option value="产">产</option>
           </select>
         </label>
-        <LockedButton frozen={frozen} onClick={() => go()}>{frozen ? '晋升（已冻结·点按探针）' : '晋升'}</LockedButton>
-        <LockedButton frozen={frozen} className="danger release-gate-btn" onClick={releaseToProd}>
-          {frozen ? '放行到产（已关闭·点按探针）' : '放行到产'}
+        <LockedButton frozen={frozen} mouth="晋升" data-open={current?.写口?.晋升 ? '1' : '0'} onClick={() => go()}>{frozen ? `晋升（${closedLabel}）` : '晋升'}</LockedButton>
+        <LockedButton frozen={frozen} mouth="放行" data-open={current?.写口?.放行 ? '1' : '0'} className="danger release-gate-btn" onClick={releaseToProd}>
+          {frozen ? `放行到产（${closedLabel}）` : '放行到产'}
         </LockedButton>
         <button type="button" className="secondary" onClick={() => load().catch((e) => setErr(e.message))}>刷新</button>
       </div>

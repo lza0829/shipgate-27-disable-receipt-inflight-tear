@@ -2,6 +2,12 @@ from __future__ import annotations
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 from app.services import disable_surface
+from app.services.surface_core import (
+    build_disable_core,
+    disable_app_transaction,
+    enable_app_transaction,
+    heal_app_transaction,
+)
 
 from app.db import db, write_txn
 from app.services.common import (
@@ -79,7 +85,7 @@ def _counts_by_app(conn) -> dict[int, dict]:
     return {r["app_id"]: dict(r) for r in rows}
 
 
-def app_payload(row, counts: dict | None = None) -> dict:
+def app_payload(row, counts: dict | None = None, core: dict | None = None) -> dict:
     d = dict(row)
     status = d.get("状态")
     fate = fate_of_status(status)
@@ -87,26 +93,61 @@ def app_payload(row, counts: dict | None = None) -> dict:
     inflight_n = int((counts or {}).get("在途数") or 0)
     trace_frozen_n = int((counts or {}).get("冻结留痕数") or 0)
     retired_like = fate in ("retired", "dirty_closed")
-    return {
+    suspended = fate == "suspended"
+    payload = {
         **d,
         "开闭态": app_open_state(status),
         "命运": RETIRE_FATE,
+        "命运态": fate,
+        "应用命运": fate,
+        "fate": fate,
         "退役": fate == "retired" and status == "退役",
         "是否退役": fate == "retired",
+        "异常收口": fate == "dirty_closed",
+        "停用": suspended,
+        "是否停用": suspended,
+        "停用标": suspended and status == "停用",
         "写口": app_write_mouths(status),
         "未收口数": unclosed_n,
         "在途数": inflight_n,
         # 规则派生：退役态下全部未收口单都算冻结在途，哪怕持久化标记被半截写脏。
         "冻结在途数": unclosed_n if retired_like else trace_frozen_n,
         "冻结留痕数": trace_frozen_n,
+        "入闸写口拒": app_write_mouths(status).get("入闸") is False,
+        "晋升写口拒": app_write_mouths(status).get("晋升") is False,
     }
+    if core is not None:
+        payload.update(
+            {
+                "停用核": core,
+                "停用灯": core.get("灯"),
+                "停用缺口数": core.get("缺口数", 0),
+                "干净": core.get("干净", True),
+                "同核收口": core.get("同核收口", True),
+                "审计重放": core.get("审计重放"),
+                "回执": core.get("回执"),
+                "evidence": core.get("evidence"),
+                "证据": core.get("证据"),
+            }
+        )
+    elif suspended:
+        # Suspended rows always carry the rule-derived mouth state even when a
+        # caller does not need the full audit/reconciliation core.
+        payload.update(
+            {
+                "停用灯": "rule-only",
+                "停用缺口数": None,
+                "同核收口": False,
+            }
+        )
+    return payload
 
 
 def _get_app_row(conn, app_id: int):
     row = conn.execute(
         """
         SELECT id AS 编号, name AS 名称, owner AS 负责人,
-               status AS 状态, retired_at AS 退役时间
+               status AS 状态, retired_at AS 退役时间, disabled_at AS 停用时间
         FROM apps WHERE id=?
         """,
         (app_id,),
@@ -184,13 +225,17 @@ def list_retired_apps():
         rows = conn.execute(
             """
             SELECT id AS 编号, name AS 名称, owner AS 负责人,
-                   status AS 状态, retired_at AS 退役时间
+                   status AS 状态, retired_at AS 退役时间, disabled_at AS 停用时间
             FROM apps WHERE status='退役' OR status LIKE '%退役%'
             ORDER BY id
             """
         ).fetchall()
         counts = _counts_by_app(conn)
-        return [app_payload(r, counts.get(r["编号"])) for r in rows]
+        result = []
+        for r in rows:
+            core = build_disable_core(conn, r["编号"])
+            result.append(app_payload(r, counts.get(r["编号"]), core))
+        return result
 
 
 @router.get("/应用")
@@ -199,19 +244,25 @@ def list_apps():
         rows = conn.execute(
             """
             SELECT id AS 编号, name AS 名称, owner AS 负责人,
-                   status AS 状态, retired_at AS 退役时间
-            FROM apps ORDER BY id
+                   status AS 状态, retired_at AS 退役时间, disabled_at AS 停用时间
+            FROM apps
+            ORDER BY id
             """
         ).fetchall()
         counts = _counts_by_app(conn)
-        return [app_payload(r, counts.get(r["编号"])) for r in rows]
+        result = []
+        for r in rows:
+            core = build_disable_core(conn, r["编号"])
+            result.append(app_payload(r, counts.get(r["编号"]), core))
+        return result
 
 
 @router.get("/应用/{app_id}")
 def get_app(app_id: int):
     with db() as conn:
         row = _get_app_row(conn, app_id)
-        return app_payload(row, _counts_by_app(conn).get(app_id))
+        core = build_disable_core(conn, app_id)
+        return app_payload(row, _counts_by_app(conn).get(app_id), core)
 
 
 @router.get("/应用/{app_id}/未收口")
@@ -242,8 +293,14 @@ def create_app(body: AppIn):
     with db() as conn:
         try:
             cur = conn.execute(
-                "INSERT INTO apps(name, owner, status, retired_at) VALUES (?, ?, ?, ?)",
-                (body.名称, body.负责人, status, now_str() if status == "退役" else None),
+                "INSERT INTO apps(name, owner, status, retired_at, disabled_at) VALUES (?, ?, ?, ?, ?)",
+                (
+                    body.名称,
+                    body.负责人,
+                    status,
+                    now_str() if status == "退役" else None,
+                    now_str() if status == "停用" else None,
+                ),
             )
         except Exception:
             raise HTTPException(400, "应用名已存在")
@@ -254,6 +311,8 @@ def create_app(body: AppIn):
         if status == "退役":
             freeze_unclosed_releases(conn, aid)
             audit(conn, "应用", aid, "退役", "创建即退役")
+        if status == "停用":
+            audit(conn, "应用", aid, "停用", "创建即停用；入闸/晋升推进写口关闭")
         return {"编号": aid}
 
 
@@ -290,18 +349,8 @@ def set_app_status(app_id: int, body: AppPatchIn):
 
 @router.post("/应用/{app_id}/收口")
 def heal_app(app_id: int):
-    """Explicit rule replay / repair mouth for a dirty half retirement."""
-    from app.services.common import heal_retirement_in_txn
-
-    with write_txn() as conn:
-        raw = conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
-        if not raw:
-            raise HTTPException(404, "应用不存在")
-        changed = heal_retirement_in_txn(conn, raw)
-        row = _get_app_row(conn, app_id)
-        payload = app_payload(row, _counts_by_app(conn).get(app_id))
-    payload["收口动作"] = "已重放并收口" if changed else "状态一致，无需收口"
-    return payload
+    """Explicit rule replay / repair mouth for dirty retirement/disable halves."""
+    return heal_app_transaction(app_id)
 
 
 @router.patch("/应用/{app_id}")
@@ -322,6 +371,37 @@ def patch_app(app_id: int, body: AppPatchIn):
                 conn.execute("UPDATE apps SET name=?, owner=? WHERE id=?", (name, owner, app_id))
         payload.update({"编号": app_id, "更新时间": now_str()})
         return payload
+
+    # 停用也必须走同核事务：标、写口拒、在途收口痕迹与审计一起落。
+    if new_status == "停用":
+        payload = disable_app_transaction(app_id)
+        if body.名称 is not None or body.负责人 is not None:
+            with db() as conn:
+                raw = conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
+                name = body.名称 if body.名称 is not None else raw["name"]
+                owner = body.负责人 if body.负责人 is not None else raw["owner"]
+                conn.execute("UPDATE apps SET name=?, owner=? WHERE id=?", (name, owner, app_id))
+        payload.update({"编号": app_id, "更新时间": now_str()})
+        return payload
+
+    # 停用后显式恢复启用：同事务清掉停用推进冻结痕迹，避免“标开了写口仍灰”。
+    if new_status == "启用":
+        with db() as conn:
+            raw = conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
+            if not raw:
+                raise HTTPException(404, "应用不存在")
+            if fate_of_status(raw["status"]) == "suspended":
+                payload = enable_app_transaction(app_id)
+                if body.名称 is not None or body.负责人 is not None:
+                    name = body.名称 if body.名称 is not None else raw["name"]
+                    owner = body.负责人 if body.负责人 is not None else raw["owner"]
+                    with db() as profile_conn:
+                        profile_conn.execute(
+                            "UPDATE apps SET name=?, owner=? WHERE id=?",
+                            (name, owner, app_id),
+                        )
+                payload.update({"编号": app_id, "更新时间": now_str()})
+                return payload
 
     with write_txn() as conn:
         raw = conn.execute("SELECT * FROM apps WHERE id=?", (app_id,)).fetchone()
